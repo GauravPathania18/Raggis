@@ -49,6 +49,6 @@ print(f"Created {len(chunks)} semantic chunks")
 print(f"{'='*60}")
 
 for i, chunk in enumerate(chunks, 1):
-    preview = chunk[:300] + "..." if len(chunk) > 300 else chunk
+    preview = chunk
     print(f"\n--- Chunk {i} ({len(chunk)} chars) ---")
     print(preview)
