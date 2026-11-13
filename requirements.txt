@@ -1,0 +1,36 @@
+# Core Hierarchical RAG Pipeline Dependencies
+# 100% Native Local Execution (Zero Docker required)
+
+# Vector Store & Embedding Engine
+chromadb>=0.5.0
+
+# Numerical, Dimensionality Reduction & Clustering
+scikit-learn>=1.4.0
+numpy>=1.26.0
+pandas>=2.0.0
+
+# M3 hybrid retrieval and cross-encoder rerank (exact pins, spec: pin library versions)
+rank-bm25==0.2.2
+faiss-cpu==1.13.2
+scipy==1.15.1
+torch==2.11.0
+transformers==4.38.1
+tokenizers==0.15.2
+sentencepiece==0.2.0
+
+# Document Ingestion & PDF Processing
+PyPDF2>=3.0.0
+tiktoken>=0.5.0
+
+# Local API & Native Ollama Client Communication
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Web UI Application (FastAPI + SSE Token Streaming)
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Evaluation Harness & Testing (eval/)
+pytest>=8.0.0
+pyyaml>=6.0.0

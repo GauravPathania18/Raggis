@@ -1,71 +1,125 @@
 import requests
+import re
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import time
 from datetime import datetime
 import json
 import os
 import sys
 
-# Import backend from mk3.py
+from modules.config import config
+from modules.logger import get_logger, setup_logger
+import concurrent.futures
+from modules.retrieval import (
+    BM25Scorer,
+    reciprocal_rank_fusion,
+    deduplicate_retrieved_chunks,
+    rerank_hybrid_candidates,
+    is_chitchat_query,
+    is_common_chat_query,
+    detect_document_intent,
+    retrieve_conversation_memories,
+    retrieval_result_cache,
+    collapsed_tree_fusion,
+    pack_collapsed_context
+)
+from modules.web_search import (
+    search_web,
+    needs_web_search
+)
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+logger = get_logger("face")
+
+# Import backend from main.py
 try:
-    from mk3 import HierarchicalClusterSummarizer
+    from main import HierarchicalClusterSummarizer
 except ImportError:
-    print("❌ Error: Could not import from mk3.py")
-    print("   Make sure mk3.py is in the same directory")
+    print("❌ Error: Could not import HierarchicalClusterSummarizer from main.py")
+    print("   Make sure main.py is in the same directory")
     sys.exit(1)
 
 
 class RAGInterface:
     """
-    Conversational RAG Interface using mk3.py for retrieval and Ollama for generation
+    Conversational RAG Interface using main.py for retrieval and Ollama for generation
+    Runs locally using ChromaDB PersistentClient and native Ollama
     """
     
     def __init__(self, 
-                 chroma_path: str = "./hierarchical_chroma_db",  # FIXED: matches mk3.py
-                 ollama_model: str = "gemma3:1b",
-                 ollama_url: str = "http://localhost:11434/api/generate",
-                 max_context_chunks: int = 5,
-                 include_summaries: bool = True,
-                 temperature: float = 0.3,
+                 ollama_model: Optional[str] = None, 
+                 ollama_embedding_model: Optional[str] = None,
+                 ollama_url: Optional[str] = None,
+                 chroma_path: Optional[str] = None,
+                 chroma_host: Optional[str] = None,
+                 chroma_port: Optional[int] = None,
+                 max_context_chunks: Optional[int] = None,
+                 include_summaries: Optional[bool] = None,
+                 temperature: Optional[float] = None,
+                 min_score: Optional[float] = None,
+                 source_filter: Optional[str] = None,
+                 dense_weight: Optional[float] = None,
+                 bm25_weight: Optional[float] = None,
+                 coverage_weight: Optional[float] = None,
+                 enable_jaccard_dedup: Optional[bool] = None,
+                 max_jaccard_overlap: Optional[float] = None,
                  verbose: bool = True):
         """
-        Initialize the RAG Interface
-        
-        Args:
-            chroma_path: Path to ChromaDB storage (must match mk3.py)
-            ollama_model: Ollama model name
-            ollama_url: Ollama API endpoint
-            max_context_chunks: Number of chunks to retrieve
-            include_summaries: Whether to include cluster summaries
-            temperature: LLM temperature (0-1)
-            verbose: Print detailed information
+        Initialize the RAG Interface with local services
         """
         self.verbose = verbose
-        
-        # Initialize the mk3 processor (this gives us all the retrieval capabilities)
-        self.processor = HierarchicalClusterSummarizer(
-            chroma_path=chroma_path,
-            ollama_model=ollama_model,
-            ollama_url=ollama_url
-        )
-        
-        self.ollama_model = ollama_model
-        self.ollama_url = ollama_url
-        self.max_context_chunks = max_context_chunks
-        self.include_summaries = include_summaries
-        self.temperature = temperature
+        self.ollama_model = ollama_model or config.ollama.generation_model
+        ollama_url_clean = (ollama_url or config.ollama.url).rstrip('/')
+        self.ollama_url = f"{ollama_url_clean}/api/generate"
+        self.max_context_chunks = max_context_chunks if max_context_chunks is not None else config.retrieval.max_context_chunks
+        self.include_summaries = include_summaries if include_summaries is not None else config.retrieval.include_summaries
+        self.temperature = temperature if temperature is not None else config.retrieval.temperature
+        self.min_score = min_score if min_score is not None else config.retrieval.min_relevance_score
+        self.source_filter = source_filter
+        self.dense_weight = dense_weight if dense_weight is not None else config.retrieval.dense_weight
+        self.bm25_weight = bm25_weight if bm25_weight is not None else config.retrieval.bm25_weight
+        self.coverage_weight = coverage_weight if coverage_weight is not None else config.retrieval.coverage_weight
+        self.enable_jaccard_dedup = enable_jaccard_dedup if enable_jaccard_dedup is not None else config.retrieval.enable_jaccard_dedup
+        self.max_jaccard_overlap = max_jaccard_overlap if max_jaccard_overlap is not None else config.retrieval.max_jaccard_overlap
         self.conversation_history = []
         self.current_session = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.record_conversation_memory = False
+        self.last_llm_calls = 0
+        
+        # High-performance persistent connection pooling (eliminates Windows TCP handshaking delays)
+        self.session = requests.Session()
+        cpu_threads = min(12, os.cpu_count() or 4)
+        self.ollama_options = {
+            "temperature": self.temperature,
+            "num_predict": 28,
+            "top_k": 30,
+            "top_p": 0.9,
+            "num_ctx": 512,
+            "num_thread": cpu_threads
+        }
+
+        # Initialize the processor with local ChromaDB & Ollama
+        self.processor = HierarchicalClusterSummarizer(
+            ollama_model=self.ollama_model,
+            ollama_embedding_model=ollama_embedding_model or config.ollama.embedding_model,
+            ollama_url=ollama_url_clean,
+            chroma_path=chroma_path or config.chroma.path,
+            chroma_host=chroma_host or config.chroma.host,
+            chroma_port=chroma_port or config.chroma.port
+        )
         
         # Check connections
         self._check_ollama()
         self._show_database_info()
     
     def _check_ollama(self) -> bool:
-        """Check if Ollama is running"""
+        """Check if Ollama is running locally"""
         try:
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+            url_clean = config.ollama.url.rstrip('/')
+            response = self.session.get(f"{url_clean}/api/tags", timeout=5)
             if response.status_code == 200:
                 models = response.json().get('models', [])
                 model_names = [m.get('name', '') for m in models]
@@ -80,231 +134,697 @@ class RAGInterface:
             return False
         except Exception as e:
             print(f"❌ Cannot connect to Ollama: {e}")
-            print("   Please start Ollama with: ollama serve")
+            print("   Please start Ollama with: ollama serve (or launch Ollama from the Start Menu)")
             return False
     
     def _show_database_info(self):
-        """Show information about the database"""
+        """Show information about conversational memory and ChromaDB"""
         try:
-            total_chunks = self.processor.chunks_collection.count()
-            total_summaries = self.processor.summaries_collection.count()
+            conv_count = self.processor.conv_chunks_collection.count() if hasattr(self.processor, 'conv_chunks_collection') else 0
+            conv_sum_count = self.processor.conv_summaries_collection.count() if hasattr(self.processor, 'conv_summaries_collection') else 0
+            total_chunks = self.processor.chunks_collection.count() if hasattr(self.processor, 'chunks_collection') else 0
+            total_summaries = self.processor.summaries_collection.count() if hasattr(self.processor, 'summaries_collection') else 0
             
             if self.verbose:
-                print(f"📚 Database: {total_chunks} chunks, {total_summaries} summaries")
-                
-                # Show source distribution
+                print(f"🧠 Conversational Memory: {conv_count} past turn(s) indexed, {conv_sum_count} memory cluster(s)")
                 if total_chunks > 0:
-                    result = self.processor.chunks_collection.get(include=["metadatas"], limit=10000)
-                    sources = {}
-                    for meta in result['metadatas']:
-                        source = meta.get('source_file', 'Unknown')
-                        sources[source] = sources.get(source, 0) + 1
-                    
-                    print(f"📄 Sources: {len(sources)} document(s)")
-                    for source, count in sources.items():
-                        print(f"   • {source}: {count} chunks")
-                else:
-                    print("   ⚠️ Database is empty! Run mk3.py first to add documents.")
-                    
+                    print(f"📚 Auxiliary Documents: {total_chunks} chunks, {total_summaries} summaries")
         except Exception as e:
+            print(f"Database info error: {e}")
             print(f"⚠️ Could not get database info: {e}")
     
-    def retrieve_context(self, query: str) -> Dict:
+    def retrieve_context(self, query: str, source_filter: Optional[str] = None) -> Dict:
         """
-        Retrieve relevant context from ChromaDB using the mk3 processor's collections
-        
-        Args:
-            query: User question
-            
-        Returns:
-            Dictionary with retrieved chunks, metadata, and scores
+        High-performance context retrieval:
+          - Fast chit-chat bypass (0 ms) for pure conversational queries (Item 2.3).
+          - Retrieval result LRU caching (Item 2.4).
+          - Single query embedding computation with LRU cache.
+          - Concurrent collection queries via ThreadPoolExecutor (Item 3.3).
+          - Hybrid BM25 + dense reranking, score thresholding, and deduplication.
+        Target retrieval latency: <= 0.5s (max 2.0s).
         """
+        if not query or not query.strip():
+            return {'success': False, 'message': 'Empty or blank query provided'}
+
+        t_start = time.perf_counter()
+        clean_q = query.strip()
+        effective_source = source_filter if source_filter is not None else self.source_filter
+
+        # Check if user explicitly requested a specific document source filter (e.g. /source Steve Jobs.pdf):
+        is_explicit_document_search = bool(
+            effective_source and effective_source.strip().lower() not in ('none', 'chat', 'general', 'direct', 'normal', 'off', 'common', 'all')
+        )
+
+        has_docs = hasattr(self.processor, 'chunks_collection') and self.processor.chunks_collection.count() > 0
+        indexed_sources = self.processor.get_indexed_sources() if has_docs else []
+
+        auto_activate_doc_rag = False
+        if has_docs and not is_explicit_document_search:
+            needs_doc, detected_src = detect_document_intent(clean_q, indexed_sources=indexed_sources)
+            if needs_doc:
+                auto_activate_doc_rag = True
+                if detected_src:
+                    effective_source = detected_src
+                if self.verbose:
+                    src_info = f" (matched: '{effective_source}')" if effective_source else " (all indexed documents)"
+                    print(f"📚 Prompt requires document retrieval: automatically activating Document RAG{src_info}.")
+
+        # 0. DEFAULT MODE: Conversational AI with Episodic Memory & Web Search Fact Grounding
+        # Used when the query does not require local document retrieval
+        if not is_explicit_document_search and not auto_activate_doc_rag:
+            # Check if query is a factual / world knowledge question requiring real-time web search
+            should_search_web = needs_web_search(clean_q, has_doc_intent=False, has_memory_intent=False)
+            web_results = []
+            if should_search_web:
+                if self.verbose:
+                    print(f"🌐 Factual query detected: searching web/internet for verified facts...")
+                try:
+                    web_results = search_web(clean_q, max_results=3)
+                except Exception as w_err:
+                    logger.warning(f"Error during web search: {w_err}")
+                    web_results = []
+
+            has_web = bool(web_results)
+
+            conv_memories = []
+            conv_summaries = []
+            # Only check episodic memory if query is NOT grounded by real-time web search
+            if not has_web:
+                conv_memories, conv_summaries = retrieve_conversation_memories(
+                    query=clean_q,
+                    conv_chunks_col=self.processor.conv_chunks_collection if hasattr(self.processor, 'conv_chunks_collection') else None,
+                    conv_summaries_col=self.processor.conv_summaries_collection if hasattr(self.processor, 'conv_summaries_collection') else None,
+                    store=self.processor.store
+                )
+
+            has_recalled_memory = bool(conv_memories)
+
+            if self.verbose:
+                if has_web:
+                    print(f"🌐 Web Search retrieved {len(web_results)} verified web sources.")
+                elif has_recalled_memory:
+                    print(f"🧠 Recalled {len(conv_memories)} relevant past conversation turn(s) from memory.")
+                else:
+                    print(f"💬 Conversational mode (no past chat memory or web search needed).")
+
+            mode = 'web_search' if has_web else ('conversational_memory' if has_recalled_memory else 'common_chat')
+            web_sources = [r.get('domain') or r.get('url') for r in web_results] if has_web else []
+
+            return {
+                'success': True,
+                'is_chitchat': not has_web,
+                'is_common_chat': True,
+                'is_web_search': has_web,
+                'has_recalled_memory': has_recalled_memory,
+                'chat_mode': mode,
+                'chunks': [],
+                'metadatas': [],
+                'scores': [],
+                'cluster_summaries': [],
+                'conversation_memories': conv_memories,
+                'conversation_cluster_summaries': conv_summaries,
+                'web_results': web_results,
+                'sources': web_sources,
+                'query': clean_q,
+                'source_filter': None,
+                'low_confidence': False,
+                'retrieval_time': time.perf_counter() - t_start
+            }
+
+        if effective_source:
+            indexed_sources = self.processor.get_indexed_sources()
+            if effective_source not in indexed_sources:
+                clean_target = effective_source[:-4].strip().lower() if effective_source.lower().endswith('.pdf') else effective_source.strip().lower()
+                matches = [s for s in indexed_sources if clean_target in s.lower()]
+                if matches:
+                    effective_source = matches[0]
+
+        # 1. Check Retrieval Result Cache (Item 2.4)
+        cache_key = (clean_q.lower(), effective_source, self.max_context_chunks, self.min_score, self.include_summaries)
+        cached_res = retrieval_result_cache.get(cache_key)
+        if cached_res is not None:
+            cached_res['retrieval_time'] = time.perf_counter() - t_start
+            return cached_res
+
         if self.verbose:
-            print(f"\n🔍 Retrieving context for: {query[:80]}...")
-        
+            filter_str = f" [Filter: '{effective_source}']" if effective_source else ""
+            print(f"\n🔍 Retrieving context for: {clean_q[:80]}...{filter_str}")
+
         try:
-            # Use mk3's chunks_collection directly for HNSW search
-            results = self.processor.chunks_collection.query(
-                query_texts=[query],
-                n_results=self.max_context_chunks,
-                include=["documents", "metadatas", "distances"]
-            )
-            
-            if not results['documents'] or not results['documents'][0]:
-                return {'success': False, 'message': 'No relevant documents found'}
-            
-            retrieved_chunks = results['documents'][0]
-            retrieved_metadatas = results['metadatas'][0]
-            retrieved_distances = results['distances'][0]
-            
-            # Calculate relevance scores (cosine distance to similarity)
-            relevance_scores = [1 - d for d in retrieved_distances]
-            
-            # Get cluster summaries if requested (using mk3's summaries_collection)
-            cluster_summaries = []
-            if self.include_summaries:
-                clusters = set()
-                for meta in retrieved_metadatas:
-                    if meta and 'cluster_id' in meta:
-                        clusters.add(meta['cluster_id'])
+            if self.processor.chunks_collection.count() == 0:
+                return {'success': False, 'message': 'Database is empty. Please ingest documents with main.py first.'}
+
+            # 2. Compute query embedding ONCE with LRU caching (Item 2.4 & 3.3)
+            query_emb = self.processor.store.get_query_embedding(clean_q)
+            candidate_pool_size = max(self.max_context_chunks * 3, 12)
+
+            # 3. Parallel Query Execution across Collections (Item 3.3)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                # Task A: Primary document chunks
+                chunks_where = {"source_file": effective_source} if effective_source else None
+                fut_chunks = executor.submit(
+                    self.processor.chunks_collection.query,
+                    query_embeddings=[query_emb],
+                    n_results=candidate_pool_size,
+                    where=chunks_where,
+                    include=["documents", "metadatas", "distances"]
+                )
+
+                # Task B: Hierarchical document summaries
+                fut_summaries = None
+                if self.include_summaries and self.processor.summaries_collection.count() > 0:
+                    # Keep cross-document summaries (source_file='multiple') visible under a source filter
+                    sums_where = {"source_file": {"$in": [effective_source, "multiple"]}} if effective_source else None
+                    fut_summaries = executor.submit(
+                        self.processor.summaries_collection.query,
+                        query_embeddings=[query_emb],
+                        n_results=3,
+                        where=sums_where,
+                        include=["documents", "metadatas", "distances"]
+                    )
+
+                # Task C: Conversation memory chunks
+                fut_conv = None
+                if config.retrieval.include_conversation_memory and hasattr(self.processor, 'conv_chunks_collection') and self.processor.conv_chunks_collection.count() > 0:
+                    fut_conv = executor.submit(
+                        self.processor.conv_chunks_collection.query,
+                        query_embeddings=[query_emb],
+                        n_results=min(config.retrieval.max_memory_chunks, self.processor.conv_chunks_collection.count()),
+                        include=["documents", "metadatas", "distances"]
+                    )
+
+                # Task D: Conversation cluster summaries
+                fut_csum = None
+                if hasattr(self.processor, 'conv_summaries_collection') and self.processor.conv_summaries_collection.count() > 0:
+                    fut_csum = executor.submit(
+                        self.processor.conv_summaries_collection.query,
+                        query_embeddings=[query_emb],
+                        n_results=min(2, self.processor.conv_summaries_collection.count()),
+                        include=["documents", "metadatas", "distances"]
+                    )
+
+                try:
+                    results = fut_chunks.result()
+                except Exception as e:
+                    logger.warning(f"Error querying chunks collection: {e}")
+                    results = None
+
+                try:
+                    summary_results = fut_summaries.result() if fut_summaries else None
+                except Exception as e:
+                    logger.warning(f"Error querying summaries collection: {e}")
+                    summary_results = None
+
+                try:
+                    mem_results = fut_conv.result() if fut_conv else None
+                except Exception as e:
+                    logger.warning(f"Error querying conversation memory collection: {e}")
+                    mem_results = None
+
+                try:
+                    csum_results = fut_csum.result() if fut_csum else None
+                except Exception as e:
+                    logger.warning(f"Error querying conversation summaries collection: {e}")
+                    csum_results = None
+
+            if not results or not results.get('documents') or not results['documents'][0]:
+                return {'success': False, 'message': f"No relevant chunks found{f' for source {effective_source}' if effective_source else ''}."}
+
+            raw_chunks = results['documents'][0]
+            raw_metadatas = results['metadatas'][0]
+            raw_distances = results['distances'][0]
+            raw_ids = results.get('ids', [[]])[0] if results and results.get('ids') else []
+            for idx, meta in enumerate(raw_metadatas):
+                if meta is not None and idx < len(raw_ids):
+                    meta['chroma_id'] = raw_ids[idx]
+
+            # 4. Collapsed Tree Fusion (RAPTOR Upgrade - ICLR 2024)
+            if config.retrieval.enable_collapsed_retrieval:
+                s_docs = summary_results['documents'][0] if summary_results and summary_results.get('documents') and summary_results['documents'][0] else None
+                s_metas = summary_results['metadatas'][0] if summary_results and summary_results.get('metadatas') and summary_results['metadatas'][0] else None
+                s_dists = summary_results['distances'][0] if summary_results and summary_results.get('distances') and summary_results['distances'][0] else None
+                s_ids = summary_results.get('ids', [[]])[0] if summary_results and summary_results.get('ids') else []
+                if s_metas:
+                    for idx, smeta in enumerate(s_metas):
+                        if smeta is not None and idx < len(s_ids):
+                            smeta['chroma_id'] = s_ids[idx]
                 
-                for cluster_id in clusters:
-                    try:
-                        # Use mk3's summaries_collection directly
-                        summary_results = self.processor.summaries_collection.get(
-                            where={"cluster_id": cluster_id},
-                            limit=1,
-                            include=["documents", "metadatas"]
-                        )
-                        if summary_results['documents']:
-                            summary_text = summary_results['documents'][0]
-                            summary_meta = summary_results['metadatas'][0]
-                            cluster_summaries.append({
-                                'cluster_id': cluster_id,
-                                'level': summary_meta.get('level', 0),
-                                'chunks_count': summary_meta.get('chunks_count', 0),
-                                'summary': summary_text[:500]
-                            })
-                    except Exception as e:
-                        if self.verbose:
-                            print(f"  Could not fetch summary for cluster {cluster_id}: {e}")
-            
-            # Extract unique sources
+                candidates = collapsed_tree_fusion(
+                    raw_chunks=raw_chunks,
+                    raw_metas=raw_metadatas,
+                    raw_dists=raw_distances,
+                    summary_docs=s_docs,
+                    summary_metas=s_metas,
+                    summary_dists=s_dists
+                )
+            else:
+                candidates = []
+                for doc, meta, dist in zip(raw_chunks, raw_metadatas, raw_distances):
+                    dense_score = max(0.0, min(1.0, 1.0 - float(dist)))
+                    candidates.append({
+                        'document': doc,
+                        'metadata': meta,
+                        'distance': dist,
+                        'dense_score': dense_score,
+                        'node_type': 'leaf_chunk'
+                    })
+
+            # Hybrid Reranking (BM25 + Dense Vector + Query Term Coverage across collapsed tree)
+            dense_w = getattr(self, 'dense_weight', config.retrieval.dense_weight)
+            bm25_w = getattr(self, 'bm25_weight', config.retrieval.bm25_weight)
+            cov_w = getattr(self, 'coverage_weight', config.retrieval.coverage_weight)
+            reranked_candidates = rerank_hybrid_candidates(
+                clean_q, candidates, dense_weight=dense_w, bm25_weight=bm25_w, coverage_weight=cov_w
+            )
+
+            # Score Thresholding: strict relevance and keyword coverage check
+            threshold = max(self.min_score, 0.35)
+            q_word_count = len(clean_q.split())
+            cov_threshold = 0.20 if q_word_count > 15 else 0.35
+
+            passed_candidates = [
+                c for c in reranked_candidates 
+                if c['rerank_score'] >= threshold and (c.get('coverage_score', 0) >= cov_threshold or (c.get('node_type') == 'tree_summary' and c.get('coverage_score', 0) >= 0.15))
+            ]
+            low_confidence = (len(passed_candidates) == 0)
+            if low_confidence:
+                top_score = reranked_candidates[0]['rerank_score'] if reranked_candidates else 0.0
+                top_cov = reranked_candidates[0].get('coverage_score', 0.0) if reranked_candidates else 0.0
+
+                # Unrelated query detection:
+                # If no source was explicitly manually filtered by user, and top candidate has poor semantic relevance / coverage,
+                # then this query is UNRELATED to the memory documents! Transition cleanly to Common Chat mode.
+                if not is_explicit_document_search and (top_score < 0.35 or top_cov < 0.20):
+                    if self.verbose:
+                        print(f"💬 Query has low document grounding (top_score={top_score:.1%}, cov={top_cov:.1%}). Transitioning to Common Chat.")
+                    return {
+                        'success': True,
+                        'is_chitchat': True,
+                        'is_common_chat': True,
+                        'chat_mode': 'common_chat',
+                        'chunks': [],
+                        'metadatas': [],
+                        'scores': [],
+                        'cluster_summaries': [],
+                        'conversation_memories': [],
+                        'conversation_cluster_summaries': [],
+                        'sources': [],
+                        'query': clean_q,
+                        'source_filter': None,
+                        'low_confidence': False,
+                        'unrelated_to_documents': True,
+                        'retrieval_time': time.perf_counter() - t_start
+                    }
+                elif reranked_candidates and top_score >= 0.35 and top_cov >= 0.25:
+                    passed_candidates = reranked_candidates[:1]
+                else:
+                    passed_candidates = []
+
+            # Chunk Deduplication for leaf chunks
+            cand_docs = [c['document'] for c in passed_candidates if c.get('node_type') == 'leaf_chunk']
+            cand_metas = [c['metadata'] for c in passed_candidates if c.get('node_type') == 'leaf_chunk']
+            cand_scores = [c['rerank_score'] for c in passed_candidates if c.get('node_type') == 'leaf_chunk']
+
+            enable_dedup = getattr(self, 'enable_jaccard_dedup', config.retrieval.enable_jaccard_dedup)
+            max_jaccard = getattr(self, 'max_jaccard_overlap', config.retrieval.max_jaccard_overlap)
+
+            if enable_dedup:
+                deduped_chunks, deduped_metas, deduped_scores = deduplicate_retrieved_chunks(
+                    cand_docs, cand_metas, cand_scores, max_jaccard_overlap=max_jaccard
+                )
+            else:
+                deduped_chunks, deduped_metas, deduped_scores = cand_docs, cand_metas, cand_scores
+
+            # Re-integrate deduped chunks into unified pool alongside tree summaries
+            final_candidates = []
+            for d_chunk, d_meta, d_score in zip(deduped_chunks, deduped_metas, deduped_scores):
+                final_candidates.append({
+                    'document': d_chunk,
+                    'metadata': d_meta,
+                    'rerank_score': d_score,
+                    'node_type': 'leaf_chunk'
+                })
+            for c in passed_candidates:
+                if c.get('node_type') == 'tree_summary':
+                    final_candidates.append(c)
+
+            final_candidates.sort(key=lambda x: x['rerank_score'], reverse=True)
+
+            # 5. Budget-Aware Context Packing (guarantees TTFT <= 1.8s)
+            packed = pack_collapsed_context(
+                final_candidates,
+                max_tokens=config.retrieval.collapsed_token_budget,
+                max_chunks=self.max_context_chunks,
+                max_summaries=1
+            )
+
+            retrieved_chunks = packed['chunks']
+            retrieved_metadatas = packed['metadatas']
+            relevance_scores = packed['scores']
+            cluster_summaries = packed['cluster_summaries']
+            collapsed_items = packed['collapsed_items']
+            retrieved_ids = [m.get('chroma_id') for m in retrieved_metadatas if m and m.get('chroma_id')]
+            if not retrieved_ids:
+                retrieved_ids = [m.get('chroma_id') for m in raw_metadatas if m and m.get('chroma_id')]
+
             sources = []
             for meta in retrieved_metadatas:
                 if meta and 'source_file' in meta:
                     sources.append(meta['source_file'])
-            sources = list(set(sources))
-            
-            return {
+            sources = sorted(list(set(sources)))
+
+            # 6. Process Conversational Memories
+            conversation_memories = []
+            if mem_results and mem_results.get('documents') and mem_results['documents'][0]:
+                for m_doc, m_meta, m_dist in zip(
+                    mem_results['documents'][0],
+                    mem_results['metadatas'][0],
+                    mem_results['distances'][0]
+                ):
+                    m_score = max(0.0, min(1.0, 1.0 - float(m_dist)))
+                    if m_score >= 0.20:
+                        conversation_memories.append({
+                            'text': m_doc,
+                            'chat_id': m_meta.get('chat_id'),
+                            'chat_title': m_meta.get('chat_title', 'Previous Chat'),
+                            'turn_index': m_meta.get('turn_index', 0),
+                            'timestamp': m_meta.get('timestamp', ''),
+                            'score': m_score
+                        })
+
+            # 7. Process Conversational Cluster Themes
+            conv_cluster_summaries = []
+            if csum_results and csum_results.get('documents') and csum_results['documents'][0]:
+                for cs_doc, cs_meta, cs_dist in zip(
+                    csum_results['documents'][0],
+                    csum_results['metadatas'][0],
+                    csum_results['distances'][0]
+                ):
+                    cs_score = max(0.0, min(1.0, 1.0 - float(cs_dist)))
+                    if cs_score >= 0.25:
+                        conv_cluster_summaries.append({
+                            'summary': cs_doc,
+                            'dense_summary': cs_meta.get('dense_summary', ''),
+                            'chats_represented': cs_meta.get('chats_represented', 'Chats'),
+                            'score': cs_score,
+                            'level': cs_meta.get('level', 0)
+                        })
+
+            elapsed = time.perf_counter() - t_start
+            result_dict = {
                 'success': True,
+                'is_chitchat': False,
+                'retrieved_ids': retrieved_ids,
                 'chunks': retrieved_chunks,
                 'metadatas': retrieved_metadatas,
                 'scores': relevance_scores,
                 'cluster_summaries': cluster_summaries,
+                'conversation_memories': conversation_memories,
+                'conversation_cluster_summaries': conv_cluster_summaries,
                 'sources': sources,
-                'query': query
+                'query': clean_q,
+                'source_filter': effective_source,
+                'low_confidence': low_confidence,
+                'collapsed_items': collapsed_items,
+                'retrieval_time': elapsed
             }
-            
-        except Exception as e:
-            return {'success': False, 'message': f'Error retrieving context: {str(e)}'}
-    
-    def build_prompt(self, context: Dict) -> str:
-        """
-        Build a prompt for the LLM using retrieved context
-        
-        Args:
-            context: Retrieved context dictionary from retrieve_context()
-            
-        Returns:
-            Formatted prompt
-        """
-        prompt_parts = []
-        
-        # System instruction
-        prompt_parts.append("""You are a knowledgeable assistant. Answer the question based ONLY on the provided context.
 
-INSTRUCTIONS:
-- Answer based only on the information in the context
-- If the context doesn't contain the answer, say "I don't have enough information to answer that"
-- Be concise but thorough
-- When quoting sources, mention the document name
-- Use a helpful, friendly tone
-""")
+            retrieval_result_cache.put(cache_key, result_dict)
+            return result_dict
+
+        except Exception as e:
+            logger.error(f"Error retrieving context: {e}", exc_info=True)
+            return {'success': False, 'message': f'Error retrieving context: {str(e)}', 'query': clean_q}
+
+    def build_prompt(self, context: Dict, session_history: Optional[List[Dict]] = None) -> str:
+        """
+        Build a concise, evidence-dense prompt prioritizing primary source evidence,
+        verified web search facts, and conversational memory.
+        """
+        user_query = context.get('query', '')
         
-        # Add source information
-        if context.get('sources'):
-            prompt_parts.append(f"\n📚 SOURCES: {', '.join(context['sources'])}")
+        # 1. Real-Time Web Search Mode: Strict Factual Correctness
+        web_results = context.get('web_results', [])
+        if web_results:
+            prompt_parts = [
+                "You are APEX, a factually precise, authoritative, and concise AI assistant.",
+                "Verified real-time web search results from the internet are provided below:\n",
+                "[Verified Web Search Evidence]:"
+            ]
+            for idx, r in enumerate(web_results[:3], 1):
+                title = r.get('title', 'Web Source')
+                domain = r.get('domain', 'internet')
+                snippet = r.get('snippet', '')[:280].strip()
+                prompt_parts.append(f"[{idx}] Source: {title} ({domain})")
+                prompt_parts.append(f"    Evidence: {snippet}")
+
+            prompt_parts.extend([
+                "\nInstructions for 100% Factual Correctness:",
+                "- Answer the user's question directly and accurately using ONLY the verified web search evidence above.",
+                "- Ensure complete factual accuracy. Do not guess, speculate, or state claims not verified by the evidence.",
+                "- Keep your answer direct, clear, and concise (under 2-3 sentences).",
+                f"\nQuestion: {user_query}",
+                "Answer:"
+            ])
+            return "\n".join(prompt_parts)
+
+        # 2. Conversational Mode (Default): Pure conversation or conversational memory recall
+        if context.get('is_common_chat') or context.get('is_chitchat') or (not context.get('chunks') and not context.get('cluster_summaries')):
+            prompt_parts = []
+            conv_memories = context.get('conversation_memories', [])
+            if conv_memories:
+                prompt_parts.append("You are APEX, a thoughtful, articulate, and friendly AI companion with memory of past conversations.")
+                prompt_parts.append("Relevant memory recalled from your previous discussions with the user is provided below:")
+                prompt_parts.append("\n[Recalled Memory from Previous Conversation]:")
+                for mem in conv_memories[:2]:
+                    doc_text = mem.get('text', '').strip()
+                    prompt_parts.append(f"{doc_text}")
+                prompt_parts.append("\nInstructions:")
+                prompt_parts.append("- Directly and warmly answer the user's question using this recalled memory.")
+                prompt_parts.append("- Speak naturally like a friend remembering prior chats (e.g., 'As you mentioned earlier...', 'You told me before that...').")
+                prompt_parts.append("- Keep your answer direct, warm, and concise (under 2-3 sentences).")
+                prompt_parts.append("- Do not mention document restrictions or say 'the context does not contain'.")
+            else:
+                prompt_parts.append("You are APEX, a thoughtful, articulate, and friendly AI companion.")
+                prompt_parts.append("Answer directly, conversationally, and helpfully using broad general knowledge.")
+                prompt_parts.append("Keep your answer concise and engaging (under 2-3 sentences).")
+                prompt_parts.append("Speak naturally like an intelligent partner. Do not mention document restrictions or say 'the context does not contain'.")
+
+            # Recent in-session chat
+            history_to_use = session_history if session_history is not None else self.conversation_history
+            if history_to_use and len(user_query.split()) <= 35:
+                prompt_parts.append("\nRecent chat in this session:")
+                for turn in history_to_use[-2:]:
+                    if isinstance(turn, dict):
+                        q = turn.get('question') or turn.get('content', '')
+                        a = turn.get('answer', '')
+                        if q and a:
+                            prompt_parts.append(f"User: {q[:100]}")
+                            prompt_parts.append(f"APEX: {a[:100]}")
+
+            prompt_parts.append(f"\nUser: {user_query}")
+            prompt_parts.append("APEX:")
+            return "\n".join(prompt_parts)
+
+        prompt_parts = [
+            "Directly answer in 1-2 sentences using source. Cite [Doc, Page]:\n"
+        ]
         
-        # Add cluster summaries if available
-        if context.get('cluster_summaries'):
-            prompt_parts.append("\n📊 HIGH-LEVEL TOPIC SUMMARIES:")
-            for summary_info in context['cluster_summaries']:
-                prompt_parts.append(f"\nTopic {summary_info['cluster_id']} (Level {summary_info['level']}, {summary_info['chunks_count']} chunks):")
-                prompt_parts.append(f"{summary_info['summary']}")
-        
-        # Add relevant chunks with metadata
-        prompt_parts.append("\n📄 RELEVANT CONTENT:")
-        for i, (chunk, score, meta) in enumerate(zip(
-            context['chunks'], 
-            context['scores'], 
-            context['metadatas']
+        # Primary source evidence (budgeted per chunk)
+        chunks_to_use = context.get('chunks', [])[:self.max_context_chunks]
+        per_chunk_limit = 350 if len(chunks_to_use) <= 1 else 250
+        for i, (chunk, meta) in enumerate(zip(
+            chunks_to_use, 
+            context.get('metadatas', [])[:self.max_context_chunks]
         )):
-            source = meta.get('source_file', 'Unknown') if meta else 'Unknown'
-            chunk_id = meta.get('chunk_id', 'Unknown') if meta else 'Unknown'
-            prompt_parts.append(f"\n[{i+1}] (Source: {source}, Relevance: {score:.2%})")
-            prompt_parts.append(f"{chunk}")
+            source = meta.get('source_file', 'Doc') if meta else 'Doc'
+            page_num = meta.get('page_number', '?') if meta else '?'
+            clean_chunk = chunk[:per_chunk_limit].strip().replace('\n', ' ')
+            prompt_parts.append(f"[{source}, Page {page_num}]: {clean_chunk}")
         
-        # Add conversation history (last 3 exchanges)
-        if self.conversation_history:
-            prompt_parts.append("\n💬 CONVERSATION HISTORY:")
-            for turn in self.conversation_history[-3:]:
-                prompt_parts.append(f"Q: {turn['question']}")
-                prompt_parts.append(f"A: {turn['answer'][:200]}...")
+        # Thematic summary (if present and enabled)
+        if context.get('cluster_summaries') and self.include_summaries:
+            for summary_info in context['cluster_summaries'][:1]:
+                summary_text = (summary_info.get('dense_summary') or summary_info.get('summary', ''))[:150].strip().replace('\n', ' ')
+                prompt_parts.append(f"[Theme]: {summary_text}")
         
-        # Add the current question
-        prompt_parts.append(f"\n❓ QUESTION: {context['query']}")
-        prompt_parts.append("\n✅ ANSWER:")
-        
+        # Episodic memory is deliberately NOT injected here: recalled turns contain the
+        # system's own past answers, and a small generator copies them over the
+        # document evidence (a wrong answer, once stored, gets repeated forever).
+        # Only the user's earlier questions from this session are kept, so follow-ups
+        # ("what did she give him?") can still be resolved.
+        history_to_use = session_history if session_history is not None else self.conversation_history
+        prior_questions = []
+        for turn in history_to_use or []:
+            if not isinstance(turn, dict):
+                continue
+            if 'question' in turn:
+                q = turn.get('question', '')
+            elif turn.get('role') == 'user':
+                q = turn.get('content', '')
+            else:
+                continue
+            q = (q or '').strip()
+            if q and q != user_query.strip():
+                prior_questions.append(q)
+        if prior_questions:
+            prompt_parts.append("\nEarlier questions in this chat (for resolving references only, not evidence):")
+            for q in prior_questions[-2:]:
+                prompt_parts.append(f"- {q[:150]}")
+
+        prompt_parts.append(f"\nQuestion: {user_query}\nAnswer:")
         return "\n".join(prompt_parts)
     
-    def generate_response(self, prompt: str) -> Dict:
+    def generate_response(self, prompt: str, is_common_chat: bool = False, user_query: Optional[str] = None) -> Dict:
         """
-        Generate response using Ollama
-        
-        Args:
-            prompt: Formatted prompt
-            
-        Returns:
-            Dictionary with response and metadata
+        Generate response using native Ollama LLM with keep-alive model pinning,
+        tuned context size, thread count, and retry backoff (Item 2.2).
         """
         if self.verbose:
-            print("🤖 Generating response...")
-        
+            print(" Generating response...")
+
+        max_retries = config.ollama.max_retries
+        retry_delay = config.ollama.retry_delay
+        timeout = config.ollama.timeout
+
+        # Adaptive options based on mode: Common Chat balances speed and completeness
+        options = dict(self.ollama_options)
+        if is_common_chat:
+            if user_query:
+                q_text = user_query
+            else:
+                m = re.search(r'(?:User|Question):\s*(.+)', prompt)
+                q_text = m.group(1) if m else prompt
+            is_coding = bool(re.search(r'\b(code|function|script|python|javascript|program|algorithm|class|def|import)\b', q_text, re.IGNORECASE))
+            has_memory = "[Recalled Memory from Previous Conversation]" in prompt
+            has_web = "[Verified Web Search Evidence]" in prompt
+            if is_coding:
+                options["num_predict"] = 120
+                options["temperature"] = 0.3
+            elif has_web:
+                options["num_predict"] = 90
+                options["temperature"] = 0.1
+            elif has_memory:
+                options["num_predict"] = 45
+                options["temperature"] = 0.3
+            else:
+                options["num_predict"] = 35
+                options["temperature"] = 0.4
+        else:
+            options["num_predict"] = 80
+            options["temperature"] = self.temperature
+
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                self.last_llm_calls = getattr(self, 'last_llm_calls', 0) + 1
+                response = self.session.post(
+                    self.ollama_url,
+                    json={
+                        "model": self.ollama_model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": options,
+                        "keep_alive": -1
+                    },
+                    timeout=timeout
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    answer = result.get('response', '').strip()
+
+                    return {
+                        'success': True,
+                        'answer': answer,
+                        'tokens': len(answer.split()),
+                        'model': self.ollama_model
+                    }
+                else:
+                    last_error = f"Ollama API returned HTTP {response.status_code}: {response.text}"
+                    logger.warning(f"Generation attempt {attempt}/{max_retries} failed: {last_error}")
+
+            except requests.exceptions.Timeout:
+                last_error = f"Ollama request timed out after {timeout}s (attempt {attempt}/{max_retries})."
+                logger.warning(last_error)
+            except requests.exceptions.ConnectionError:
+                last_error = f"Cannot connect to Ollama on {self.ollama_url}. Make sure 'ollama serve' is running."
+                logger.warning(last_error)
+            except Exception as e:
+                last_error = f"Unexpected generation error: {str(e)}"
+                logger.error(last_error)
+                break
+
+            if attempt < max_retries:
+                time.sleep(retry_delay * (1.5 ** (attempt - 1)))
+
+        return {
+            'success': False,
+            'error': f"{last_error} (Troubleshooting: Run 'ollama serve' and ensure '{self.ollama_model}' is pulled)."
+        }
+
+    def generate_response_stream(self, prompt: str, is_common_chat: bool = False, user_query: Optional[str] = None):
+        """
+        Stream response tokens from native Ollama in real-time (Item 2.2).
+        Yields token strings as they arrive from Ollama.
+        """
+        options = dict(self.ollama_options)
+        if is_common_chat:
+            if user_query:
+                q_text = user_query
+            else:
+                m = re.search(r'(?:User|Question):\s*(.+)', prompt)
+                q_text = m.group(1) if m else prompt
+            is_coding = bool(re.search(r'\b(code|function|script|python|javascript|program|algorithm|class|def|import)\b', q_text, re.IGNORECASE))
+            has_memory = "[Recalled Memory from Previous Conversation]" in prompt
+            has_web = "[Verified Web Search Evidence]" in prompt
+            if is_coding:
+                options["num_predict"] = 120
+                options["temperature"] = 0.3
+            elif has_web:
+                options["num_predict"] = 90
+                options["temperature"] = 0.1
+            elif has_memory:
+                options["num_predict"] = 45
+                options["temperature"] = 0.3
+            else:
+                options["num_predict"] = 35
+                options["temperature"] = 0.4
+        else:
+            options["num_predict"] = 80
+            options["temperature"] = self.temperature
+
         try:
-            response = requests.post(
+            with self.session.post(
                 self.ollama_url,
                 json={
                     "model": self.ollama_model,
                     "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": self.temperature,
-                        "num_predict": -1,
-                        "top_k": 40,
-                        "top_p": 0.9
-                    }
+                    "stream": True,
+                    "options": options,
+                    "keep_alive": -1
                 },
-                timeout=60
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                answer = result.get('response', '').strip()
-                
-                return {
-                    'success': True,
-                    'answer': answer,
-                    'tokens': len(answer.split()),
-                    'model': self.ollama_model
-                }
-            else:
-                return {
-                    'success': False,
-                    'error': f"API error: {response.status_code}"
-                }
-                
-        except requests.exceptions.Timeout:
-            return {'success': False, 'error': "Request timeout"}
+                stream=True,
+                timeout=config.ollama.timeout
+            ) as response:
+                for line in response.iter_lines(chunk_size=1):
+                    if line:
+                        chunk = json.loads(line)
+                        token = chunk.get("response", "")
+                        yield token
+                        if chunk.get("done", False):
+                            break
         except Exception as e:
-            return {'success': False, 'error': str(e)}
+            logger.error(f"Streaming error: {e}")
+            yield f"\n[Streaming error: {e}]" 
     
-    def query(self, question: str) -> Dict:
+    def query(self, question: str, source_filter: Optional[str] = None) -> Dict:
         """
-        Complete RAG query: Retrieve using mk3, Augment, Generate
+        Complete RAG query: Retrieve using main.py, Augment, Generate
         
         Args:
             question: User question
+            source_filter: Optional source_file name to restrict search (Item 23)
             
         Returns:
             Dictionary with answer and metadata
@@ -315,8 +835,19 @@ INSTRUCTIONS:
         print(f"📝 Question: {question}")
         print("="*80)
         
-        # Step 1: Retrieve context using mk3's HNSW search
-        context = self.retrieve_context(question)
+        # Caution check: empty or whitespace question
+        if not question or not str(question).strip():
+            msg = "⚠️ Caution: Empty question provided. Please provide a non-empty question."
+            print(f"\n{msg}")
+            return {
+                'question': question,
+                'answer': msg,
+                'sources': [],
+                'context_chunks': 0,
+                'response_time': 0.0
+            }
+        
+        context = self.retrieve_context(question, source_filter=source_filter)
         
         if not context.get('success'):
             return {
@@ -327,18 +858,36 @@ INSTRUCTIONS:
                 'response_time': time.time() - start_time
             }
         
-        # Step 2: Build prompt with context
-        prompt = self.build_prompt(context)
+        has_recalled_memory = bool(context.get('conversation_memories'))
+        has_web_results = bool(context.get('web_results'))
+        is_common_chat = context.get('is_common_chat', False) or context.get('is_chitchat', False) or (not context.get('chunks') and not context.get('cluster_summaries'))
+
+        if has_web_results:
+            web_count = len(context['web_results'])
+            print(f"🌐 Mode: Web Search Fact Grounding (Retrieved {web_count} verified web sources)")
+            if self.verbose:
+                for idx, w in enumerate(context['web_results']):
+                    print(f"   • [{idx+1}] {w.get('title')} ({w.get('domain')})")
+        elif has_recalled_memory:
+            mem_count = len(context['conversation_memories'])
+            print(f"🧠 Mode: Conversational Memory (Recalled {mem_count} relevant past turn{'s' if mem_count > 1 else ''})")
+            if self.verbose:
+                for idx, m in enumerate(context['conversation_memories']):
+                    text_prev = m.get('text', '').replace('\n', ' ')[:90]
+                    print(f"   • Memory {idx+1}: \"{text_prev}...\" (Sim: {m.get('score', 0):.1%})")
+        elif is_common_chat:
+            print("💬 Mode: Conversational (General Knowledge / Dialogue)")
+        elif context.get('low_confidence'):
+            print("\n⚠️ Caution: Low similarity confidence (< 25%). Context may not directly answer this question.")
         
-        # Step 3: Generate response
-        response = self.generate_response(prompt)
+        prompt = self.build_prompt(context)
+        response = self.generate_response(prompt, is_common_chat=is_common_chat, user_query=question)
         
         elapsed_time = time.time() - start_time
         
         if response.get('success'):
             answer = response['answer']
             
-            # Save to conversation history
             self.conversation_history.append({
                 'question': question,
                 'answer': answer,
@@ -346,30 +895,61 @@ INSTRUCTIONS:
                 'sources': context.get('sources', [])
             })
             
-            # Display results
+            if getattr(self, 'record_conversation_memory', True) and hasattr(self.processor, 'add_conversation_turn'):
+                import threading
+                threading.Thread(
+                    target=self.processor.add_conversation_turn,
+                    kwargs={
+                        'chat_id': self.current_session,
+                        'user_text': question,
+                        'assistant_text': answer,
+                        'turn_index': len(self.conversation_history),
+                        'chat_title': 'Session Chat'
+                    },
+                    daemon=True
+                ).start()
+            
             print(f"\n✅ Response ({elapsed_time:.2f}s, {response.get('tokens', 0)} tokens):")
             print("-"*80)
             print(answer)
             print("-"*80)
             
             if context.get('sources'):
-                print(f"\n📚 Sources: {', '.join(context['sources'])}")
+                src_label = "🌐 Web Sources" if has_web_results else "📚 Sources"
+                print(f"\n{src_label}: {', '.join(context['sources'])}")
             
-            if self.verbose:
-                print(f"\n📊 Retrieved {len(context.get('chunks', []))} chunks with scores:")
+            if self.verbose and not is_common_chat:
+                print(f"\n📊 Retrieved {len(context.get('chunks', []))} primary chunks:")
                 for i, (chunk, score, meta) in enumerate(zip(
-                    context.get('chunks', [])[:3],
-                    context.get('scores', [])[:3],
-                    context.get('metadatas', [])[:3]
+                    context.get('chunks', [])[:10],
+                    context.get('scores', [])[:10],
+                    context.get('metadatas', [])[:10]
                 )):
-                    print(f"   [{i+1}] {score:.2%} - {meta.get('source_file', 'Unknown')[:40]}")
+                    page_str = f" (p. {meta.get('page_number', '?')})" if meta and 'page_number' in meta else ""
+                    chunk_id = meta.get('chunk_id', 'Unknown') if meta and 'chunk_id' in meta else 'Unknown'
+                    print(f"   [{i+1}] {score:.2%} [Chunk: {chunk_id}] - {meta.get('source_file', 'Unknown')[:40]}{page_str}")
+                
+                if context.get('cluster_summaries'):
+                    print(f"\n🌐 Auxiliary Thematic Context:")
+                    for s in context['cluster_summaries']:
+                        srcs = ", ".join(s.get('sources', []))
+                        print(f"   • Level {s.get('level', 0)} Cluster {s.get('cluster_id')} | Relevance: {s.get('score', 0):.2%} | Silhouette: {s.get('silhouette_score', 0):.3f} | Sources: [{srcs}]")
             
             return {
                 'question': question,
                 'answer': answer,
                 'sources': context.get('sources', []),
+                'chunks': context.get('chunks', []),
+                'retrieved_ids': context.get('retrieved_ids', []),
                 'context_chunks': len(context.get('chunks', [])),
                 'relevance_scores': context.get('scores', []),
+                'conversation_memories': context.get('conversation_memories', []),
+                'web_results': context.get('web_results', []),
+                'has_recalled_memory': has_recalled_memory,
+                'has_web_results': has_web_results,
+                'is_common_chat': is_common_chat,
+                'chat_mode': 'document_rag' if (context.get('chunks') or context.get('cluster_summaries')) else ('conversational_memory' if has_recalled_memory else ('web_search' if has_web_results else 'common_chat')),
+                'unrelated_to_documents': context.get('unrelated_to_documents', False),
                 'response_time': elapsed_time,
                 'tokens_generated': response.get('tokens', 0),
                 'conversation_turns': len(self.conversation_history)
@@ -379,25 +959,51 @@ INSTRUCTIONS:
                 'question': question,
                 'answer': f"Error: {response.get('error', 'Unknown error')}",
                 'sources': [],
+                'chunks': [],
+                'retrieved_ids': context.get('retrieved_ids', []),
                 'context_chunks': 0,
+                'has_recalled_memory': has_recalled_memory,
+                'chat_mode': 'conversational_memory' if has_recalled_memory else ('common_chat' if is_common_chat else 'document_rag'),
                 'response_time': elapsed_time
             }
+
+    def answer(self, question: str) -> Dict[str, Any]:
+        """
+        Evaluation harness interface per HARNESS.md Section 4:
+        result = pipeline.answer(question: str) -> dict
+        
+        Returns:
+            answer: str (final generated answer)
+            retrieved_ids: list[str] (chunk IDs in ranked order, as returned to generation)
+            llm_calls: int (number of LLM invocations for this query)
+        """
+        self.record_conversation_memory = False
+        self.last_llm_calls = 0
+        res = self.query(question)
+        self._last_retrieved_chunks = res.get('chunks', [])
+        return {
+            'answer': res.get('answer', ''),
+            'retrieved_ids': res.get('retrieved_ids', []),
+            'retrieved_chunks': res.get('chunks', []),
+            'llm_calls': getattr(self, 'last_llm_calls', 0)
+        }
     
     def interactive_mode(self):
         """Run interactive conversation mode"""
         print("\n" + "="*80)
-        print("🎯 FACE - RAG Interface (Frontend for Hierarchical Knowledge Base)")
+        print("🤖 APEX - Conversational AI with Episodic Memory")
         print("="*80)
-        print(f"📚 Database: {self.processor.chunks_collection.count()} chunks total")
-        print(f"🤖 Model: {self.ollama_model}")
-        print(f"📊 Context: {self.max_context_chunks} chunks, Summaries: {self.include_summaries}")
+        conv_c = self.processor.conv_chunks_collection.count() if hasattr(self.processor, 'conv_chunks_collection') else 0
+        print(f"🧠 Memory: {conv_c} past turns remembered across sessions")
+        print(f"💬 Conversational Mode: Active (No document dependencies)")
+        print(f"🤖 Ollama Model: {self.ollama_model}")
         print("\nCommands:")
-        print("  /clear    - Clear conversation history")
-        print("  /stats    - Show database statistics")
-        print("  /sources  - Show all documents in database")
-        print("  /clusters - Show cluster summaries")
-        print("  /help     - Show this help")
-        print("  /quit     - Exit")
+        print("  /memories       - Show recent conversation memories remembered in ChromaDB")
+        print("  /clear          - Clear current session memory")
+        print("  /stats          - Show memory statistics")
+        print("  /source <name>  - (Optional) Filter queries to a specific source document")
+        print("  /help           - Show this help")
+        print("  /quit           - Exit")
         print("="*80)
         
         while True:
@@ -407,10 +1013,30 @@ INSTRUCTIONS:
                 if not user_input:
                     continue
                 
-                # Handle commands
                 if user_input.lower() == '/quit':
                     print("\n👋 Goodbye!")
                     break
+                    
+                elif user_input.lower() == '/memories':
+                    self.show_memories()
+                    continue
+
+                elif user_input.lower().startswith('/source'):
+                    parts = user_input.split(maxsplit=1)
+                    if len(parts) == 1:
+                        if self.source_filter:
+                            print(f"📌 Active source filter: '{self.source_filter}'")
+                        else:
+                            print("📌 No source filter active (conversational mode).")
+                    else:
+                        sub = parts[1].strip()
+                        if sub.lower() in ('clear', 'none', 'reset', 'all'):
+                            self.source_filter = None
+                            print("✅ Source filter cleared. Conversational mode active.")
+                        else:
+                            self.source_filter = sub
+                            print(f"✅ Source filter set to: '{self.source_filter}'")
+                    continue
                     
                 elif user_input.lower() == '/clear':
                     self.conversation_history = []
@@ -433,7 +1059,6 @@ INSTRUCTIONS:
                     self.show_help()
                     continue
                 
-                # Process query
                 result = self.query(user_input)
                 
             except KeyboardInterrupt:
@@ -443,18 +1068,17 @@ INSTRUCTIONS:
                 print(f"\n❌ Error: {e}")
     
     def show_stats(self):
-        """Show database statistics"""
+        """Show database statistics from local ChromaDB"""
         try:
             total_chunks = self.processor.chunks_collection.count()
             total_summaries = self.processor.summaries_collection.count()
             
-            print("\n📊 DATABASE STATISTICS")
+            print("\n📊 DATABASE STATISTICS (ChromaDB)")
             print("="*60)
             print(f"Total chunks: {total_chunks}")
             print(f"Total summaries: {total_summaries}")
             print(f"Session queries: {len(self.conversation_history)}")
             
-            # Show source distribution
             if total_chunks > 0:
                 result = self.processor.chunks_collection.get(include=["metadatas"], limit=10000)
                 sources = {}
@@ -469,6 +1093,26 @@ INSTRUCTIONS:
         except Exception as e:
             print(f"Error getting stats: {e}")
     
+    def show_memories(self):
+        """Show recent conversation memories remembered in ChromaDB"""
+        try:
+            col = self.processor.conv_chunks_collection
+            count = col.count()
+            print("\n🧠 CONVERSATIONAL MEMORY (ChromaDB)")
+            print("="*60)
+            print(f"Total turns remembered: {count}")
+            if count > 0:
+                res = col.get(limit=10, include=["documents", "metadatas"])
+                for i, (cid, doc, meta) in enumerate(zip(res['ids'], res['documents'], res['metadatas'])):
+                    title = meta.get('chat_title', 'Chat')
+                    ts = meta.get('timestamp', '')[:19]
+                    print(f"\n  [{i+1}] Session: {title} ({ts})")
+                    for line in doc.split('\n')[:2]:
+                        print(f"      {line[:85]}")
+            print("="*60)
+        except Exception as e:
+            print(f"Error fetching memories: {e}")
+    
     def show_sources(self):
         """Show all documents in the database"""
         try:
@@ -478,7 +1122,7 @@ INSTRUCTIONS:
                 source = meta.get('source_file', 'Unknown')
                 sources[source] = sources.get(source, 0) + 1
             
-            print("\n📚 DOCUMENTS IN DATABASE")
+            print("\n📚 DOCUMENTS IN DATABASE (ChromaDB)")
             print("="*60)
             for source, count in sorted(sources.items()):
                 print(f"  • {source}: {count} chunks")
@@ -495,7 +1139,7 @@ INSTRUCTIONS:
                 return
             
             print("\n📊 CLUSTER SUMMARIES")
-            print("="*60)
+            print("="*60)   
             
             for level in sorted(df['level'].unique()):
                 level_df = df[df['level'] == level]
@@ -516,12 +1160,14 @@ INSTRUCTIONS:
         print("\n📖 HELP")
         print("="*60)
         print("Commands:")
-        print("  /clear    - Clear conversation history")
-        print("  /stats    - Show database statistics")
-        print("  /sources  - Show all documents in database")
-        print("  /clusters - Show cluster summaries")
-        print("  /help     - Show this help")
-        print("  /quit     - Exit")
+        print("  /source <name>  - Filter queries to a specific source document")
+        print("  /source clear   - Clear active source filter (search all)")
+        print("  /clear          - Clear conversation history")
+        print("  /stats          - Show database statistics")
+        print("  /sources        - Show all documents in database")
+        print("  /clusters       - Show cluster summaries")
+        print("  /help           - Show this help")
+        print("  /quit           - Exit")
         print("\nTips:")
         print("  • Ask questions about your documents")
         print("  • The system retrieves relevant chunks using HNSW search")
@@ -544,8 +1190,6 @@ INSTRUCTIONS:
             print(f"\n[{i+1}/{len(questions)}] Processing...")
             result = self.query(question)
             results.append(result)
-            
-            # Small delay to avoid overwhelming the system
             time.sleep(0.5)
         
         if output_file:
@@ -583,36 +1227,42 @@ def main():
     """Main entry point"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='FACE - RAG Interface for Hierarchical Knowledge Base')
-    parser.add_argument('--db-path', 
-                       default='./hierarchical_chroma_db',  # FIXED: matches mk3.py
-                       help='Path to ChromaDB (must match mk3.py - default: ./hierarchical_chroma_db)')
-    parser.add_argument('--model', default='gemma3:1b', help='Ollama model name')
-    parser.add_argument('--chunks', type=int, default=5, help='Number of chunks to retrieve')
+    parser = argparse.ArgumentParser(description='FACE - RAG Interface for Hierarchical Knowledge Base (Local Version)')
+    parser.add_argument('--model', default=config.ollama.generation_model, help='Ollama model name')
+    parser.add_argument('--embedding-model', default=config.ollama.embedding_model, help='Ollama embedding model')
+    parser.add_argument('--ollama-url', default=config.ollama.url, help='Ollama API URL')
+    parser.add_argument('--chroma-path', default=config.chroma.path, help='Local ChromaDB directory path')
+    parser.add_argument('--chroma-host', default=config.chroma.host, help='ChromaDB host (optional, for remote server)')
+    parser.add_argument('--chroma-port', type=int, default=config.chroma.port, help='ChromaDB port (optional, for remote server)')
+    parser.add_argument('--chunks', type=int, default=config.retrieval.max_context_chunks, help='Number of chunks to retrieve')
     parser.add_argument('--no-summaries', action='store_true', help='Disable cluster summaries')
-    parser.add_argument('--temperature', type=float, default=0.3, help='LLM temperature')
+    parser.add_argument('--temperature', type=float, default=config.retrieval.temperature, help='LLM temperature')
+    parser.add_argument('--log-level', default=config.log_level, choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Log level")
     parser.add_argument('--quiet', action='store_true', help='Suppress verbose output')
+    parser.add_argument('--source', '--filter', type=str, default=None, help='Filter retrieval to a specific document/source_file')
+    parser.add_argument('--min-score', type=float, default=config.retrieval.min_relevance_score, help='Minimum composite score threshold for context chunks')
     parser.add_argument('--query', type=str, help='Single query (non-interactive mode)')
     parser.add_argument('--batch', type=str, help='File with list of questions (one per line)')
     parser.add_argument('--export', type=str, help='Export conversation to file')
     
     args = parser.parse_args()
     
-    # Check if database path exists
-    if not os.path.exists(args.db_path):
-        print(f"\n⚠️ Database path does not exist: {args.db_path}")
-        print("   Please run mk3.py first to create the database:")
-        print("   python mk3.py")
-        print(f"\n   Or specify a different path with --db-path")
-        sys.exit(1)
+    log_lvl = "WARNING" if args.quiet else args.log_level
+    setup_logger(level=log_lvl)
     
-    # Initialize interface
+    # Initialize interface with local services
     interface = RAGInterface(
-        chroma_path=args.db_path,
         ollama_model=args.model,
+        ollama_embedding_model=args.embedding_model,
+        ollama_url=args.ollama_url,
+        chroma_path=args.chroma_path,
+        chroma_host=args.chroma_host,
+        chroma_port=args.chroma_port,
         max_context_chunks=args.chunks,
         include_summaries=not args.no_summaries,
         temperature=args.temperature,
+        min_score=args.min_score,
+        source_filter=args.source,
         verbose=not args.quiet
     )
     
@@ -620,18 +1270,16 @@ def main():
     total_chunks = interface.processor.chunks_collection.count()
     if total_chunks == 0:
         print("\n⚠️ Database is empty!")
-        print("Please add documents first using mk3.py")
-        print("Example: python mk3.py")
+        print("Please add documents first using main.py")
+        print("Example: python main.py")
         return
     
     # Handle different modes
     if args.query:
-        # Single query mode
         result = interface.query(args.query)
         print(f"\n{result['answer']}")
         
     elif args.batch:
-        # Batch query mode
         if not os.path.exists(args.batch):
             print(f"\n❌ Batch file not found: {args.batch}")
             return
@@ -640,17 +1288,12 @@ def main():
             questions = [line.strip() for line in f if line.strip()]
         
         print(f"Processing {len(questions)} questions...")
-        results = interface.batch_query(questions)
-        
-        # Export results
         output_file = f"batch_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        interface.batch_query(questions, output_file)
+        results = interface.batch_query(questions, output_file)
         
     else:
-        # Interactive mode
         interface.interactive_mode()
         
-        # Export conversation if requested
         if args.export:
             interface.export_conversation(args.export)
 

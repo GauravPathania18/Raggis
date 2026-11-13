@@ -1,0 +1,60 @@
+# Bytecode & Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Local ChromaDB Vector Databases & Index Binaries
+hierarchical_chroma_db/
+chroma_db/
+pdf_chroma_db/
+document_db/
+improved_chroma_db/
+my_chroma_data/
+chroma_data/
+*.sqlite3
+*.bin
+*.pickle
+
+# Service & LLM Storage / Private Keys
+ollama_data/
+anythingllm_data/
+
+# Generated Artifacts, Logs & CSV Reports
+outputs/
+hierarchical_summaries.csv
+clustering_history.csv
+cluster_report.csv
+batch_results_*.json
+conversation_*.json
+chats/*.json
+*.log
+
+# Environment & Virtualenvs
+.env
+venv/
+env/
+.venv/
+ENV/
+
+# Evaluation artifacts & cache
+eval/cache/
+eval/runs/
+
+# IDE Configuration
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Fair benchmark rebuilt databases (regenerable)
+eval/fair_dbs/
+
+# APEX (M1+) local state: node store, LLM cache, call logs and traces (regenerable)
+apex_db/
+.apex_cache/
+logs/
+
+# Benchmark raw data (re-download with scripts/fetch_benchmarks.py)
+data/benchmarks/
